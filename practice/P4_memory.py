@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import operator
+import uuid
+import os
 from typing import Annotated, Literal, Optional, TypedDict
 
 from pydantic import BaseModel, Field
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
+
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,6 +22,7 @@ logger = logging.getLogger("retry_graph")
 
 # Максимальное количество попыток достучаться до Бюро
 MAX_RETRIES = 2
+DB_PATH = "lending_checkpoints.db"
 
 # --------------------------------------------------------------------------
 # 1. Доменные модели
@@ -45,6 +50,7 @@ def merge_risk_signals(left: dict[str, float], right: dict[str, float]) -> dict[
 
 class UnderwritingState(TypedDict):
     applicant_national_id: str
+    bureau_request_id: str
     status: Literal["pending", "approved", "rejected", "manual_review"]
     bureau_report: Optional[BureauReport]
     fraud_flags: Annotated[list[str], operator.add]
@@ -57,8 +63,10 @@ class UnderwritingState(TypedDict):
 # 4. Имитация внешних API
 # --------------------------------------------------------------------------
 
-async def call_credit_bureau_api(national_id: str) -> BureauReport:
+async def call_credit_bureau_api(national_id: str, request_id: str) -> BureauReport:
     await asyncio.sleep(0.5)
+    logger.info(f" Отправка запроса в Бюро. Отпечаток идемпотентности: {request_id}")
+
     if "FAIL" in national_id:
         raise RuntimeError("Бюро временно недоступно")
     
@@ -81,17 +89,20 @@ async def call_fraud_screening_api(national_id: str) -> list[str]:
 
 async def credit_bureau_check_node(state: UnderwritingState) -> dict:
     national_id = state["applicant_national_id"]
+    request_id = state.get("bureau_request_id") or str(uuid.uuid5(uuid.NAMESPACE_DNS, national_id))
     logger.info("Вызов credit_bureau_check_node для %s", national_id)
     try:
-        report = await call_credit_bureau_api(national_id=national_id)
+        report = await call_credit_bureau_api(national_id=national_id, request_id=request_id)
         normalized_risk = 1.0 - (report.raw_score - 300) / 550
         return {
+            "bureau_request_id": request_id,
             "bureau_report": report,
             "risk_signals": {"credit_history_risk": round(normalized_risk, 2)}
         }
     except Exception:
         logger.warning("Сбой при обращении к кредитному бюро")
         return {
+            "bureau_request_id": request_id,
             "bureau_report": None,
             "risk_signals": {"bureau_unavailable_penalty": 0.4},
         }
@@ -175,7 +186,7 @@ async def auto_reject_node(state: UnderwritingState) -> dict:
 # 7. Сборка графа через Command(goto=...)
 # --------------------------------------------------------------------------
 
-def build_graph_command():
+def build_graph(checkpointer: AsyncSqliteSaver):
     builder = StateGraph(UnderwritingState)
 
     builder.add_node("credit_bureau_check", credit_bureau_check_node)
@@ -195,46 +206,72 @@ def build_graph_command():
     builder.add_edge("manual_review_node", END)
     builder.add_edge("auto_reject_node", END)
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
 # --------------------------------------------------------------------------
-# Тестирование сценариев
+# Демонстрация работы памяти при сбоях и продолжении
 # --------------------------------------------------------------------------
-
-async def run_test(national_id: str, description: str):
-    graph = build_graph_command()
-    initial_state: UnderwritingState = {
-        "applicant_national_id": national_id,
-        "status": "pending",
-        "bureau_report": None,
-        "fraud_flags": [],
-        "risk_signals": {},
-        "retry_count": 0,
-        "audit_log": [],
-    }
-    print(f"\n=======================================================")
-    print(f"🚀 СТАРТ ТЕСТА: {description}")
-    print(f"=======================================================")
-    
-    result = await graph.ainvoke(initial_state)
-    
-    print(f"\n📊 ИТОГОВОЕ СОСТОЯНИЕ КОРОБКИ:")
-    print(f"Итоговый статус: {result['status']}")
-    print(f"Количество попыток ретрая: {result['retry_count']}")
-    print(f"Наличие отчета: {result['bureau_report'] is not None}")
-    print(f"Хроника аудита:")
-    for log in result['audit_log']:
-        print(f"  - {log}")
-
 
 async def main():
-    # Тест 1: Всё работает штатно (Финальный риск средний -> Ручная проверка)
-    await run_test("ID-GOOD-777", "Штатный клиент (Успех с 1-й попытки)")
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
 
-    # Тест 2: Имитируем ошибку (в ID передаем слово FAIL). 
-    # Сервисы упадут, сработает ретрай, превысит MAX_RETRIES и уйдет в ручную проверку.
-    await run_test("ID-FAIL-FATAL", "Сбой сервисов (Исчерпание лимита ретраев -> Эскалация)")
+    async with AsyncSqliteSaver.from_conn_string(DB_PATH) as memory:
+        graph = build_graph(memory)
+
+        thread_config = {"configurable": {"thread_id": "session-customer-45"}}
+
+        initial_state: UnderwritingState = {
+            "applicant_national_id": "ID-FAIL-ONCE",
+            "bureau_request_id": "",
+            "status": "pending",
+            "bureau_report": None,
+            "fraud_flags": [],
+            "risk_signals": {},
+            "retry_count": 0,
+            "audit_log": [],
+        }
+
+        print("\n=======================================================")
+        print("🚀 ЗАПУСК 1: Инициация с проблемным ID")
+        print("=======================================================")
+        
+        # Граф отработает, упадет на внешних запросах и попытается уйти на ретрай.
+        result_1 = await graph.ainvoke(initial_state, config=thread_config)
+        
+        print("\n📊 СОСТОЯНИЕ ПОСЛЕ ПЕРВОГО СБОЯ:")
+        print(f"Статус: {result_1['status']}")
+        print(f"Попыток ретрая записано в БД: {result_1['retry_count']}")
+        print(f"Ключ идемпотентности, который записался в БД: {result_1['bureau_request_id']}")
+        print(f"Аудит-лог: {result_1['audit_log']}")
+
+        print("\n=======================================================")
+        print("🔧 ШАГ 2: 'Ремонт' внешних систем и перезапуск")
+        print("=======================================================")
+        print("Мы возобновляем работу по той же сессии (thread_id).")
+        print("Мы передаем новое состояние, имитируя, что ID клиента 'исправился'.")
+
+        # Обновляем состояние: теперь Бюро ответит успешно.
+        # Обратите внимание: мы НЕ передаем initial_state заново. Мы просто обновляем стейт в той же сессии.
+        await graph.aupdate_state(
+            config=thread_config,
+            values={"applicant_national_id": "ID-GOOD-777"}
+        )
+        
+        # Запускаем граф повторно по тому же thread_id, передавая None вместо стейта.
+        # LangGraph сам поднимет последнее сохраненное состояние из SQLite базы.
+        result_2 = await graph.ainvoke(None, config=thread_config)
+        
+        print("\n📊 ИТОГОВОЕ СОСТОЯНИЕ ПОСЛЕ ВОЗОБНОВЛЕНИЯ:")
+        print(f"Итоговый статус: {result_2['status']}")
+        print(f"Количество попыток ретрая: {result_2['retry_count']}")
+        print(f"Наличие отчета Бюро: {result_2['bureau_report'] is not None}")
+        print(f"Сохраненный ключ идемпотентности: {result_2['bureau_request_id']}")
+        print(f"Хроника аудита:")
+        for log in result_2['audit_log']:
+            print(f"  - {log}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
