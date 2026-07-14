@@ -3,15 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import operator
-import uuid
 import os
+import uuid
 from typing import Annotated, Literal, Optional, TypedDict
 
 from pydantic import BaseModel, Field
-from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, START, END
-from langgraph.types import Command
-
+from langgraph.types import Command, interrupt
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 logging.basicConfig(
@@ -20,12 +18,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("retry_graph")
 
-# Максимальное количество попыток достучаться до Бюро
 MAX_RETRIES = 2
 DB_PATH = "lending_checkpoints.db"
 
+
 # --------------------------------------------------------------------------
-# 1. Доменные модели
+# Модели данных
 # --------------------------------------------------------------------------
 
 class BureauReport(BaseModel):
@@ -34,134 +32,173 @@ class BureauReport(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# 2. Кастомный редьюсер
+# Кастомные редьюсеры
 # --------------------------------------------------------------------------
 
-def merge_risk_signals(left: dict[str, float], right: dict[str, float]) -> dict[str, float]:
-    merged = dict(left)
+def merge_risk_signals(
+    left: dict[str, float] | None, right: dict[str, float] | None
+) -> dict[str, float]:
+    """
+    Берёт максимум по каждому ключу — пессимистичная стратегия объединения сигналов.
+    Передача None в качестве right — сигнал полной очистки словаря.
+    """
+    if right is None:
+        return {}
+    
+    # Защита от None в left
+    merged = dict(left) if left is not None else {}
+    
     for key, value in right.items():
         merged[key] = max(merged.get(key, value), value)
     return merged
 
 
+def resettable_list(left: list[str] | None, right: list[str] | None) -> list[str]:
+    """
+    Редьюсер для списков, поддерживающий сброс.
+    Передача None в качестве right — сигнал очистки списка.
+    """
+    if right is None:
+        return []
+    base = left if left is not None else []
+    return base + right
+
+
 # --------------------------------------------------------------------------
-# 3. Схема состояния (State)
+# Состояние графа
 # --------------------------------------------------------------------------
 
 class UnderwritingState(TypedDict):
     applicant_national_id: str
     bureau_request_id: str
     status: Literal["pending", "approved", "rejected", "manual_review"]
-    bureau_report: Optional[BureauReport]
-    fraud_flags: Annotated[list[str], operator.add]
-    risk_signals: Annotated[dict[str, float], merge_risk_signals]
-    retry_count: Annotated[int, operator.add]
+    bureau_report: Optional[BureauReport]  # LWW по умолчанию (без Annotated)
+    fraud_flags: Annotated[list[str], resettable_list]
+    risk_signals: Annotated[dict[str, float] | None, merge_risk_signals]
+    retry_count: int  # LWW по умолчанию — кастомный редьюсер не нужен!
     audit_log: Annotated[list[str], operator.add]
 
 
 # --------------------------------------------------------------------------
-# 4. Имитация внешних API
+# Имитация внешних API
 # --------------------------------------------------------------------------
 
 async def call_credit_bureau_api(national_id: str, request_id: str) -> BureauReport:
     await asyncio.sleep(0.5)
-    logger.info(f" Отправка запроса в Бюро. Отпечаток идемпотентности: {request_id}")
-
     if "FAIL" in national_id:
         raise RuntimeError("Бюро временно недоступно")
-    
     return BureauReport(
         report_id=f"BUR-ID-{national_id}",
         raw_score=300 + (sum(map(ord, national_id)) % 551),
     )
 
+
 async def call_fraud_screening_api(national_id: str) -> list[str]:
     await asyncio.sleep(0.2)
     if "FAIL" in national_id:
         raise RuntimeError("Сервис фрода временно недоступен")
-    
     return ["device_fingerprint_mismatch"]
 
 
 # --------------------------------------------------------------------------
-# 5. Узлы графа
+# Узлы графа
 # --------------------------------------------------------------------------
 
 async def credit_bureau_check_node(state: UnderwritingState) -> dict:
     national_id = state["applicant_national_id"]
     request_id = state.get("bureau_request_id") or str(uuid.uuid5(uuid.NAMESPACE_DNS, national_id))
-    logger.info("Вызов credit_bureau_check_node для %s", national_id)
     try:
         report = await call_credit_bureau_api(national_id=national_id, request_id=request_id)
         normalized_risk = 1.0 - (report.raw_score - 300) / 550
         return {
             "bureau_request_id": request_id,
             "bureau_report": report,
-            "risk_signals": {"credit_history_risk": round(normalized_risk, 2)}
+            "risk_signals": {"credit_history_risk": round(normalized_risk, 2)},
         }
-    except Exception:
-        logger.warning("Сбой при обращении к кредитному бюро")
+    except Exception as exc:
+        logger.warning("credit_bureau_check: ошибка запроса — %s", exc)
         return {
             "bureau_request_id": request_id,
             "bureau_report": None,
             "risk_signals": {"bureau_unavailable_penalty": 0.4},
         }
 
+
 async def fraud_screening_node(state: UnderwritingState) -> dict:
     national_id = state["applicant_national_id"]
-    logger.info("Вызов fraud_screening_node для %s", national_id)
     try:
         triggered_rules = await call_fraud_screening_api(national_id=national_id)
         return {
             "fraud_flags": triggered_rules,
             "risk_signals": {"fraud_risk": 0.2 if not triggered_rules else 0.6},
         }
-    except Exception:
-        logger.warning("Сбой при обращении к фрауду")
+    except Exception as exc:
+        logger.warning("fraud_screening: ошибка запроса — %s", exc)
         return {
             "fraud_flags": ["ERROR_SCANNING"],
             "risk_signals": {"fraud_risk": 0.5},
         }
 
 
-# --------------------------------------------------------------------------
-# 6. Узел агрегации и управления потоком
-# --------------------------------------------------------------------------
-
-async def aggregate_risk_and_route_node(
-        state: UnderwritingState
-) -> Command[Literal["credit_bureau_check", "fraud_screening", "auto_approve_node", "manual_review_node", "auto_reject_node"]]:
+async def routing_decision_node(state: UnderwritingState) -> Command:
     report = state.get("bureau_report")
     fraud_flags = state.get("fraud_flags", [])
-    fraud_flag = fraud_flags[-1] if fraud_flags else None
     retries = state.get("retry_count", 0)
-    signals = state.get("risk_signals", {})
+    signals = state.get("risk_signals") or {}
 
-    logger.info("aggregate_node: Анализ состояния. Всего попыток сделано: %d", retries)
+    has_errors = (report is None) or ("ERROR_SCANNING" in fraud_flags)
 
-    if report is None or fraud_flag == "ERROR_SCANNING":
+    if has_errors:
         if retries < MAX_RETRIES:
-            logger.info("-> Обнаружен сбой. Лимит попыток (%d/%d) не исчерпан. Идем на ретрай.", retries, MAX_RETRIES)
+            logger.info(
+                "-> [Попытка %d/%d] Обнаружен сбой. Автоматический ретрай.",
+                retries + 1,
+                MAX_RETRIES,
+            )
             return Command(
                 update={
-                    "retry_count": 1,
-                    "audit_log": [f"Попытка {retries + 1} завершилась ошибкой. Ретрай."]
+                    "retry_count": retries + 1,  # Прямой инкремент без редьюсера
+                    "audit_log": [f"Ретрай после ошибки, круг {retries + 1}."],
                 },
-                goto=["credit_bureau_check", "fraud_screening"]
+                goto=["credit_bureau_check", "fraud_screening"],
             )
-        else:
-            logger.error("-> 🚨 Превышен лимит попыток (%d). Эскалация в ручную проверку.", retries)
-            return Command(
-                update={
-                    "status": "manual_review",
-                    "audit_log": ["Эскалация: Превышен лимит попыток запросов во внешние сервисы"]
-                },
-                goto="manual_review_node"
-            )
-        
-    final_risk_score = round(sum(signals.values()) / max(len(signals), 1), 3)
 
-    logger.info("Финальный скор риска: %f", final_risk_score)
+        # Ретраи исчерпаны — передаём управление оператору
+        logger.error("-> 🚨 Ретраи исчерпаны! Конвейер на ПАУЗЕ. Ожидаем вмешательства.")
+
+        user_decision = interrupt(
+            {
+                "reason": "Превышен лимит попыток запросов во внешние сервисы Бюро/Фрода.",
+                "current_state": {
+                    "applicant_id": state["applicant_national_id"],
+                    "bureau_request_id": state.get("bureau_request_id"),
+                    "retry_count": retries,
+                },
+            }
+        )
+
+        logger.info("-> 🧑‍💻 Сигнал получен! Новые данные от оператора: %s", user_decision)
+
+        new_id = user_decision["new_national_id"]
+
+        # Прямой и безопасный сброс всех полей
+        return Command(
+            update={
+                "applicant_national_id": new_id,
+                "retry_count": 0,                 # Сброс LWW-поля в 0
+                "bureau_report": None,            # Сброс LWW-поля в None
+                "fraud_flags": None,              # Сигнал редьюсеру resettable_list
+                "risk_signals": None,             # Сигнал редьюсеру merge_risk_signals
+                "audit_log": [
+                    f"Вмешательство оператора: ID изменён на {new_id}. Ретраи сброшены."
+                ],
+            },
+            goto=["credit_bureau_check", "fraud_screening"],
+        )
+
+    # Ошибок нет — принимаем финальное решение
+    final_risk_score = round(sum(signals.values()) / max(len(signals), 1), 3)
+    logger.info("Финальный скор риска: %.3f", final_risk_score)
 
     if final_risk_score <= 0.3:
         return Command(update={"status": "approved"}, goto="auto_approve_node")
@@ -169,29 +206,30 @@ async def aggregate_risk_and_route_node(
         return Command(update={"status": "rejected"}, goto="auto_reject_node")
     else:
         return Command(update={"status": "manual_review"}, goto="manual_review_node")
-    
+
+
 async def auto_approve_node(state: UnderwritingState) -> dict:
-    logger.info("🎉 Узел Авто-Одобрения: Заявка одобрена.")
     return {"audit_log": ["Финальный вердикт: Авто-одобрение"]}
 
+
 async def manual_review_node(state: UnderwritingState) -> dict:
-    logger.info("🧑‍💻 Узел Ручной Проверки: Отправлено андеррайтеру.")
     return {"audit_log": ["Финальный вердикт: Ручной андеррайтинг"]}
 
+
 async def auto_reject_node(state: UnderwritingState) -> dict:
-    logger.info("❌ Узел Авто-Отказа: Заявка отклонена.")
     return {"audit_log": ["Финальный вердикт: Авто-отказ"]}
 
+
 # --------------------------------------------------------------------------
-# 7. Сборка графа через Command(goto=...)
+# Сборка графа
 # --------------------------------------------------------------------------
 
-def build_graph(checkpointer: AsyncSqliteSaver):
+def build_graph(checkpointer: AsyncSqliteSaver) -> StateGraph:
     builder = StateGraph(UnderwritingState)
 
     builder.add_node("credit_bureau_check", credit_bureau_check_node)
     builder.add_node("fraud_screening", fraud_screening_node)
-    builder.add_node("aggregate_risk_and_route", aggregate_risk_and_route_node)
+    builder.add_node("routing_decision", routing_decision_node)
     builder.add_node("auto_approve_node", auto_approve_node)
     builder.add_node("manual_review_node", manual_review_node)
     builder.add_node("auto_reject_node", auto_reject_node)
@@ -199,8 +237,8 @@ def build_graph(checkpointer: AsyncSqliteSaver):
     builder.add_edge(START, "credit_bureau_check")
     builder.add_edge(START, "fraud_screening")
 
-    builder.add_edge("credit_bureau_check", "aggregate_risk_and_route")
-    builder.add_edge("fraud_screening", "aggregate_risk_and_route")
+    builder.add_edge("credit_bureau_check", "routing_decision")
+    builder.add_edge("fraud_screening", "routing_decision")
 
     builder.add_edge("auto_approve_node", END)
     builder.add_edge("manual_review_node", END)
@@ -210,17 +248,33 @@ def build_graph(checkpointer: AsyncSqliteSaver):
 
 
 # --------------------------------------------------------------------------
-# Демонстрация работы памяти при сбоях и продолжении
+# Вспомогательная функция вывода итогов
 # --------------------------------------------------------------------------
 
-async def main():
+def print_result(label: str, result: dict) -> None:
+    print(f"\n{'=' * 55}")
+    print(f"  {label}")
+    print(f"{'=' * 55}")
+    print(f"  Статус заявки  : {result.get('status')}")
+    print(f"  Ретраев (всего): {result.get('retry_count')}")
+    print(f"  Отчёт бюро    : {'получен' if result.get('bureau_report') else 'отсутствует'}")
+    print(f"  Флаги фрода   : {result.get('fraud_flags', [])}")
+    print("  Аудит-лог:")
+    for entry in result.get("audit_log", []):
+        print(f"    • {entry}")
+
+
+# --------------------------------------------------------------------------
+# Тестирование сценария «Пауза → Пробуждение»
+# --------------------------------------------------------------------------
+
+async def main() -> None:
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
 
     async with AsyncSqliteSaver.from_conn_string(DB_PATH) as memory:
         graph = build_graph(memory)
-
-        thread_config = {"configurable": {"thread_id": "session-customer-45"}}
+        thread_config = {"configurable": {"thread_id": "session-customer-99"}}
 
         initial_state: UnderwritingState = {
             "applicant_national_id": "ID-FAIL-ONCE",
@@ -234,43 +288,21 @@ async def main():
         }
 
         print("\n=======================================================")
-        print("🚀 ЗАПУСК 1: Инициация с проблемным ID")
+        print("🚀 ЗАПУСК 1: Старт процесса с проблемным ID")
         print("=======================================================")
-        
-        # Граф отработает, упадет на внешних запросах и попытается уйти на ретрай.
+
         result_1 = await graph.ainvoke(initial_state, config=thread_config)
-        
-        print("\n📊 СОСТОЯНИЕ ПОСЛЕ ПЕРВОГО СБОЯ:")
-        print(f"Статус: {result_1['status']}")
-        print(f"Попыток ретрая записано в БД: {result_1['retry_count']}")
-        print(f"Ключ идемпотентности, который записался в БД: {result_1['bureau_request_id']}")
-        print(f"Аудит-лог: {result_1['audit_log']}")
+        print_result("СОСТОЯНИЕ ПОСЛЕ ПАУЗЫ", result_1)
 
         print("\n=======================================================")
-        print("🔧 ШАГ 2: 'Ремонт' внешних систем и перезапуск")
+        print("🔧 ЗАПУСК 2: Оператор передаёт исправленный ID")
         print("=======================================================")
-        print("Мы возобновляем работу по той же сессии (thread_id).")
-        print("Мы передаем новое состояние, имитируя, что ID клиента 'исправился'.")
 
-        # Обновляем состояние: теперь Бюро ответит успешно.
-        # Обратите внимание: мы НЕ передаем initial_state заново. Мы просто обновляем стейт в той же сессии.
-        await graph.aupdate_state(
+        result_2 = await graph.ainvoke(
+            Command(resume={"new_national_id": "ID-GOOD-777"}),
             config=thread_config,
-            values={"applicant_national_id": "ID-GOOD-777"}
         )
-        
-        # Запускаем граф повторно по тому же thread_id, передавая None вместо стейта.
-        # LangGraph сам поднимет последнее сохраненное состояние из SQLite базы.
-        result_2 = await graph.ainvoke(None, config=thread_config)
-        
-        print("\n📊 ИТОГОВОЕ СОСТОЯНИЕ ПОСЛЕ ВОЗОБНОВЛЕНИЯ:")
-        print(f"Итоговый статус: {result_2['status']}")
-        print(f"Количество попыток ретрая: {result_2['retry_count']}")
-        print(f"Наличие отчета Бюро: {result_2['bureau_report'] is not None}")
-        print(f"Сохраненный ключ идемпотентности: {result_2['bureau_request_id']}")
-        print(f"Хроника аудита:")
-        for log in result_2['audit_log']:
-            print(f"  - {log}")
+        print_result("ИТОГОВОЕ СОСТОЯНИЕ ПОСЛЕ ПРОБУЖДЕНИЯ", result_2)
 
 
 if __name__ == "__main__":
